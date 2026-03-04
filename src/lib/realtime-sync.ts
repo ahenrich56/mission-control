@@ -1,5 +1,5 @@
-import { useMissionControlStore } from './store'
-import type { Task, SubAgent, Observation } from './store'
+import { useMissionControl } from './store'
+import type { Task, Agent, Observation } from './store'
 
 interface OpenClawBridgeEvent {
   type: 'task' | 'agent' | 'observation' | 'metrics' | 'connection'
@@ -36,16 +36,9 @@ interface ObservationEvent {
   emoji?: string
 }
 
-interface MetricsEvent {
-  cpu: number
-  memory: number
-  uptime: number
-  requests: number
-}
-
 class RealtimeSyncService {
   private ws: WebSocket | null = null
-  private reconnectTimeout: NodeJS.Timeout | null = null
+  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null
   private reconnectAttempts = 0
   private maxReconnectAttempts = 10
   private reconnectDelay = 1000
@@ -57,9 +50,9 @@ class RealtimeSyncService {
       this.ws = new WebSocket(this.wsUrl)
 
       this.ws.onopen = () => {
-        console.log('[RealtimeSync] Connected to OpenClaw bridge')
+        console.log('[RealtimeSync] Connected to OpenClaw gateway')
         this.reconnectAttempts = 0
-        useMissionControlStore.getState().setConnectionStatus(true)
+        useMissionControl.getState().setConnected(true)
       }
 
       this.ws.onmessage = (event) => {
@@ -76,8 +69,8 @@ class RealtimeSyncService {
       }
 
       this.ws.onclose = () => {
-        console.log('[RealtimeSync] Disconnected from OpenClaw bridge')
-        useMissionControlStore.getState().setConnectionStatus(false)
+        console.log('[RealtimeSync] Disconnected from OpenClaw gateway')
+        useMissionControl.getState().setConnected(false)
         this.attemptReconnect()
       }
     } catch (error) {
@@ -98,9 +91,7 @@ class RealtimeSyncService {
     )
 
     this.reconnectAttempts++
-    console.log(
-      `[RealtimeSync] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`
-    )
+    console.log(`[RealtimeSync] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`)
 
     this.reconnectTimeout = setTimeout(() => {
       this.connect()
@@ -108,7 +99,7 @@ class RealtimeSyncService {
   }
 
   private handleEvent(event: OpenClawBridgeEvent) {
-    const store = useMissionControlStore.getState()
+    const store = useMissionControl.getState()
 
     switch (event.type) {
       case 'task':
@@ -120,11 +111,8 @@ class RealtimeSyncService {
       case 'observation':
         this.handleObservationEvent(event, store)
         break
-      case 'metrics':
-        this.handleMetricsEvent(event, store)
-        break
       case 'connection':
-        store.setConnectionStatus(event.data as boolean)
+        store.setConnected(event.data as boolean)
         break
       default:
         console.warn('[RealtimeSync] Unknown event type:', event.type)
@@ -133,29 +121,31 @@ class RealtimeSyncService {
 
   private handleTaskEvent(
     event: OpenClawBridgeEvent,
-    store: ReturnType<typeof useMissionControlStore.getState>
+    store: ReturnType<typeof useMissionControl.getState>
   ) {
     const taskData = event.data as TaskEvent
+    const statusMap: Record<string, Task['status']> = {
+      pending: 'pending',
+      running: 'in_progress',
+      completed: 'completed',
+      failed: 'failed',
+    }
 
     switch (event.action) {
-      case 'create': {
-        const task: Task = {
-          ...taskData,
-          created_at: new Date(taskData.created_at),
-          finished_at: taskData.finished_at ? new Date(taskData.finished_at) : undefined,
-        }
-        store.addTask(task)
+      case 'create':
+        store.addTask({
+          name: taskData.id,
+          status: statusMap[taskData.status] || 'pending',
+          description: taskData.type,
+          result: taskData.result,
+        })
         break
-      }
-      case 'update': {
-        const updates: Partial<Task> = {
-          ...taskData,
-          created_at: taskData.created_at ? new Date(taskData.created_at) : undefined,
-          finished_at: taskData.finished_at ? new Date(taskData.finished_at) : undefined,
-        }
-        store.updateTask(taskData.id, updates)
+      case 'update':
+        store.updateTask(taskData.id, {
+          status: statusMap[taskData.status] || 'pending',
+          result: taskData.result,
+        })
         break
-      }
       case 'delete':
         store.removeTask(taskData.id)
         break
@@ -164,28 +154,33 @@ class RealtimeSyncService {
 
   private handleAgentEvent(
     event: OpenClawBridgeEvent,
-    store: ReturnType<typeof useMissionControlStore.getState>
+    store: ReturnType<typeof useMissionControl.getState>
   ) {
     const agentData = event.data as AgentEvent
+    const statusMap: Record<string, Agent['status']> = {
+      idle: 'idle',
+      working: 'busy',
+      paused: 'idle',
+      error: 'offline',
+    }
 
     switch (event.action) {
-      case 'create': {
-        const agent: SubAgent = {
-          ...agentData,
-          lastActivity: new Date(agentData.lastActivity),
-          logs: [],
-        }
-        store.addAgent(agent)
+      case 'create':
+        store.addAgent({
+          id: agentData.id,
+          name: agentData.name,
+          status: statusMap[agentData.status] || 'idle',
+          currentTask: agentData.currentTask || undefined,
+          lastSeen: agentData.lastActivity,
+        })
         break
-      }
-      case 'update': {
-        const updates: Partial<SubAgent> = {
-          ...agentData,
-          lastActivity: agentData.lastActivity ? new Date(agentData.lastActivity) : undefined,
-        }
-        store.updateAgent(agentData.id, updates)
+      case 'update':
+        store.updateAgent(agentData.id, {
+          status: statusMap[agentData.status] || 'idle',
+          currentTask: agentData.currentTask || undefined,
+          lastSeen: agentData.lastActivity,
+        })
         break
-      }
       case 'delete':
         store.removeAgent(agentData.id)
         break
@@ -194,30 +189,25 @@ class RealtimeSyncService {
 
   private handleObservationEvent(
     event: OpenClawBridgeEvent,
-    store: ReturnType<typeof useMissionControlStore.getState>
+    store: ReturnType<typeof useMissionControl.getState>
   ) {
     if (event.action !== 'create') return
 
     const obsData = event.data as ObservationEvent
-    const observation: Observation = {
-      id: Date.now(),
-      type: obsData.type,
-      title: obsData.title,
-      subtitle: obsData.subtitle,
-      timestamp: new Date(event.timestamp),
-      agent: obsData.agent,
-      emoji: obsData.emoji,
+    const typeMap: Record<string, Observation['type']> = {
+      decision: 'system',
+      bugfix: 'task',
+      feature: 'task',
+      refactor: 'task',
+      discovery: 'system',
+      change: 'agent',
     }
 
-    store.addObservation(observation)
-  }
-
-  private handleMetricsEvent(
-    event: OpenClawBridgeEvent,
-    store: ReturnType<typeof useMissionControlStore.getState>
-  ) {
-    const metricsData = event.data as MetricsEvent
-    store.updateMetrics(metricsData)
+    store.addObservation({
+      source: obsData.agent || 'system',
+      type: typeMap[obsData.type] || 'system',
+      message: obsData.subtitle ? `${obsData.title}: ${obsData.subtitle}` : obsData.title,
+    })
   }
 
   disconnect() {
@@ -231,7 +221,7 @@ class RealtimeSyncService {
       this.ws = null
     }
 
-    useMissionControlStore.getState().setConnectionStatus(false)
+    useMissionControl.getState().setConnected(false)
   }
 
   send(message: unknown) {
